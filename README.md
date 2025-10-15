@@ -40,7 +40,7 @@ python-dotenv>=1.0.1
 ### Windows (PowerShell)
 ```ps1
 python -m venv .venv
-.\.venv\Scriptsctivate
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 winget install Gyan.FFmpeg
 ```
