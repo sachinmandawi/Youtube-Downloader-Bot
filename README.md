@@ -61,8 +61,8 @@ pkg install -y ffmpeg python
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-and 
+
+and
 
 pkg update && pkg upgrade -y
 pkg install python ffmpeg -y
@@ -76,6 +76,8 @@ pip install -r requirements.txt     # agar file hai
 pip install pyrogram tgcrypto yt-dlp requests
 
 python YouTubeDownloaderBot.py
+
+```
 
 ### macOS
 ```bash
