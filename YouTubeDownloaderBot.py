@@ -11,16 +11,19 @@ import glob
 import hashlib
 import asyncio
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Dict, List, Tuple, Optional
 
 import yt_dlp
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, Message
 )
-from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChatWriteForbidden, ChatIdInvalid
+from pyrogram.errors import (
+    UserNotParticipant, ChatAdminRequired, ChatWriteForbidden, ChatIdInvalid,
+    ChannelPrivate, MessageNotModified
+)
 
 # ================== BOT CONFIG (YOUR DATA) ==================
 API_ID = 23292615
@@ -34,44 +37,50 @@ os.makedirs("downloads", exist_ok=True)
 CACHE_DIR = "downloads/cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ================== PERSISTENT CONFIG ==================
-CONFIG_PATH = "config.json"
-DEFAULT_CONFIG = {
-    "force_join": True,
-    "required_channels": ["@YourChannelUsername"],  # e.g., ["@ChannelOne", "@ChannelTwo"]
-    "invite_link": None,                            # set if private channel (permanent invite link)
-    "admins": [8070535163],                         # your admin ID(s)
-    "admin_bypass": True,                           # admins bypass join checks by default
-    "enforce_for_admins": False,                    # if True, even admins must join
-    "maintenance_mode": False,                      # blocks non-admins unless whitelisted
-    "whitelist": [],                                # testers allowed during maintenance
+# ================== CONFIG (direct in Python; no JSON file) ==================
+CONFIG = {
+    # Gate on /start:
+    "force_join": False,
+
+    # Add your required channels here: use @username or -100ID
+    "required_channels": [],
+
+    # For private channels, set a permanent invite link. For public groups/channels you can keep None.
+    "invite_link": None,
+
+    # Admins (Telegram numeric IDs)
+    "admins": [8070535163],
+
+    # Admin enforcement:
+    # If admin_bypass=False and enforce_for_admins=True, even admins must join required channels.
+    "admin_bypass": True,
+    "enforce_for_admins": False,
+
+    # Maintenance mode & whitelist
+    "maintenance_mode": False,
+    "whitelist": [],
+
+    # Stats (kept in-memory only)
     "stats": {
-        "users": [],                                # known user IDs
-        "downloads": 0,                             # total files sent
-        "cache_hits": 0,                            # served from cache
-        "cache_misses": 0,                          # downloaded fresh
+        "users": [],
+        "downloads": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
         "last_reset": None,
-        "last_seen": {}                             # user_id -> ISO timestamp
+        "last_seen": {}
     },
-    "cache_ttl_days": 7,                            # auto-delete cache older than N days
-    "download_lock": True                           # NEW: gate downloads behind channel join
+
+    # Cache config
+    "cache_ttl_days": 7,
+
+    # Gate right before sending downloads:
+    "download_lock": False
 }
 
-def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG
-
-CONFIG = load_config()
+# No-op saver so existing calls won't crash (we're not persisting to disk now).
+def save_config(_cfg):
+    # Intentionally do nothing (no JSON persistence)
+    pass
 
 # ================== IN-MEMORY STATE ==================
 url_store: Dict[str, str] = {}          # link_uid -> url
@@ -101,9 +110,9 @@ def add_user_stat(user_id: int):
     if user_id not in users:
         users.add(user_id)
         CONFIG["stats"]["users"] = list(users)
-    # update last_seen
+    # update last_seen (UTC aware)
     try:
-        CONFIG["stats"]["last_seen"][str(user_id)] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        CONFIG["stats"]["last_seen"][str(user_id)] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     except Exception:
         pass
     save_config(CONFIG)
@@ -188,14 +197,32 @@ async def user_worker(user_id):
             user_queues.pop(user_id, None)
             break
 
-async def safe_edit(msg, text=None, reply_markup=None):
+# Robust safe edit: avoids MESSAGE_NOT_MODIFIED, updates keyboard-only when needed
+async def safe_edit(msg: Message, text: Optional[str] = None, reply_markup: Optional[InlineKeyboardMarkup] = None, **kwargs):
     try:
+        current_text = getattr(msg, "text", None) or getattr(msg, "caption", None)
+
+        # Keyboard-only update
         if text is None:
-            await msg.edit_reply_markup(reply_markup=reply_markup)
-        else:
-            await msg.edit(text, reply_markup=reply_markup)
+            return await msg.edit_reply_markup(reply_markup=reply_markup)
+
+        # If text is identical, try updating only the keyboard; otherwise skip
+        if current_text == text:
+            if reply_markup is not None:
+                try:
+                    return await msg.edit_reply_markup(reply_markup=reply_markup)
+                except MessageNotModified:
+                    return msg
+            return msg
+
+        # Normal edit
+        return await msg.edit_text(text, reply_markup=reply_markup, **kwargs)
+
+    except MessageNotModified:
+        return msg
     except Exception:
-        pass  # benign edit races
+        # swallow benign races
+        return msg
 
 def is_fast_double_click(user_id: int, key: str, min_gap=0.35) -> bool:
     now = time.monotonic()
@@ -262,9 +289,29 @@ def join_kb():
     buttons.append([InlineKeyboardButton("✅ I’ve joined, Recheck", callback_data="recheck_join")])
     return InlineKeyboardMarkup(buttons)
 
+VALID_STATUSES = {
+    enums.ChatMemberStatus.MEMBER,
+    enums.ChatMemberStatus.ADMINISTRATOR,
+    enums.ChatMemberStatus.OWNER,  # (older name: CREATOR)
+}
+
+async def _joined_in_chat(client: Client, chat: str, user_id: int) -> bool:
+    try:
+        m = await client.get_chat_member(chat, user_id)
+        if (m.status in VALID_STATUSES) or (m.status == enums.ChatMemberStatus.RESTRICTED and getattr(m, "is_member", False)):
+            return True
+        return False
+    except UserNotParticipant:
+        return False
+    except (ChannelPrivate, ChatAdminRequired, ChatIdInvalid, ChatWriteForbidden):
+        # Bot cannot verify; fail-closed so user is asked to join via invite link
+        return False
+    except Exception:
+        return False
+
 async def is_user_member(client: Client, user_id: int) -> bool:
     """
-    Existing gate used on /start (respects CONFIG.force_join).
+    Gate used on /start (respects CONFIG.force_join).
     """
     if not CONFIG.get("force_join", True):
         return True
@@ -272,24 +319,16 @@ async def is_user_member(client: Client, user_id: int) -> bool:
     if not chans:
         return True
     for chan in chans:
-        try:
-            member = await client.get_chat_member(chan, user_id)
-            if member.status not in ("member", "administrator", "creator"):
-                return False
-        except UserNotParticipant:
-            return False
-        except (ChatAdminRequired, ChatIdInvalid, ChatWriteForbidden):
-            return False
-        except Exception:
+        if not await _joined_in_chat(client, chan, user_id):
             return False
     return True
 
 async def is_member_of_required_channels(client: Client, user_id: int) -> bool:
     """
-    Download Lock checker with admin bypass.
-    Admins bypass if CONFIG.admin_bypass=True and CONFIG.enforce_for_admins=False
+    Download Lock checker with admin enforcement.
+    Admins bypass only if admin_bypass=True and enforce_for_admins=False.
     """
-    # --- Admin bypass ---
+    # Admin bypass logic:
     if is_admin(user_id) and CONFIG.get("admin_bypass", True) and not CONFIG.get("enforce_for_admins", False):
         return True
 
@@ -297,15 +336,7 @@ async def is_member_of_required_channels(client: Client, user_id: int) -> bool:
     if not chans:
         return True
     for chan in chans:
-        try:
-            member = await client.get_chat_member(chan, user_id)
-            if member.status not in ("member", "administrator", "creator"):
-                return False
-        except UserNotParticipant:
-            return False
-        except (ChatAdminRequired, ChatIdInvalid, ChatWriteForbidden):
-            return False
-        except Exception:
+        if not await _joined_in_chat(client, chan, user_id):
             return False
     return True
 
@@ -318,7 +349,7 @@ def _log(msg):
 
 @bot.on_message(filters.command("start", prefixes=["/"]) & filters.private)
 async def start_cmd(client, message):
-    """Clean welcome (no maintenance/force-join badges) with force-join gate applied before."""
+    """Clean welcome with pre-applied force-join gate."""
     _log(f"/start from {message.from_user.id} ({message.from_user.first_name})")
 
     uid = message.from_user.id
@@ -341,12 +372,7 @@ async def start_cmd(client, message):
         if gate and (not (is_adm and admin_bypass)) and chans:
             ok = True
             for chan in chans:
-                try:
-                    m = await client.get_chat_member(chan, uid)
-                    if m.status not in ("member", "administrator", "creator"):
-                        ok = False
-                        break
-                except Exception:
+                if not await _joined_in_chat(client, chan, uid):
                     ok = False
                     break
             if not ok:
@@ -358,7 +384,7 @@ async def start_cmd(client, message):
     except Exception as e:
         _log(f"force-join check error: {e}")
 
-    # Clean, simple welcome (NO status badges)
+    # Clean, simple welcome
     return await message.reply(
         "✨ Welcome to YouTube Downloader\n"
         "🎥 Paste a YouTube link & get your video or audio instantly.\n\n"
@@ -378,9 +404,9 @@ def admin_main_kb():
         [InlineKeyboardButton("🛠 Maintenance: " + ("ON ✅" if CONFIG.get("maintenance_mode", False) else "OFF ❌"),
                               callback_data="adm_toggle_maint")],
         [InlineKeyboardButton("🔓 Download Lock: " + ("ON ✅" if CONFIG.get("download_lock", True) else "OFF ❌"),
-                              callback_data="adm_toggle_dllock")],  # NEW
+                              callback_data="adm_toggle_dllock")],
         [InlineKeyboardButton("👮 Enforce for Admins: " + ("ON ✅" if CONFIG.get("enforce_for_admins", False) else "OFF ❌"),
-                              callback_data="adm_toggle_enfadm")],   # NEW
+                              callback_data="adm_toggle_enfadm")],
         [InlineKeyboardButton("🧪 Whitelist", callback_data="adm_wl")],
         [InlineKeyboardButton("📢 Required Channels", callback_data="adm_channels"),
          InlineKeyboardButton("🔗 Invite Link", callback_data="adm_invite")],
@@ -506,7 +532,7 @@ async def catch_admin_inputs(client, message: Message):
                 "type": "text",
                 "text": txt,
                 "buttons": parse_buttons_from_text(txt),
-                "media": None,        # {'kind': 'photo'|'video'|'doc', 'file_id': ..., 'caption': str}
+                "media": None,  # {'kind': 'photo'|'video'|'doc', 'file_id': ..., 'caption': str}
             }
             if message.photo:
                 draft["type"] = "photo"
@@ -610,13 +636,14 @@ async def handle_callback(client, cb):
 
     # ---- FORCE JOIN recheck ----
     if data == "recheck_join":
-        # reuse the regular gate for recheck UX
         if await is_user_member(client, cb.from_user.id):
-            return await cb.message.edit_text("✅ Access Unlocked\nYou’re good to go!")
+            return await safe_edit(cb.message, "✅ Access Unlocked\nYou’re good to go!")
         else:
-            return await cb.message.edit_text(
+            return await safe_edit(
+                cb.message,
                 "❌ Still not detected. Please join and tap Recheck again.",
-                reply_markup=join_kb(), disable_web_page_preview=True
+                reply_markup=join_kb(),
+                disable_web_page_preview=True
             )
 
     # ---- ADMIN PANEL ----
@@ -629,27 +656,27 @@ async def handle_callback(client, cb):
         if key == "adm_toggle_force":
             CONFIG["force_join"] = not CONFIG.get("force_join", True)
             save_config(CONFIG)
-            return await cb.message.edit_text("Admin Panel (updated)", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
 
         if key == "adm_toggle_maint":
             CONFIG["maintenance_mode"] = not CONFIG.get("maintenance_mode", False)
             save_config(CONFIG)
-            return await cb.message.edit_text("Admin Panel (updated)", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
 
-        if key == "adm_toggle_dllock":  # NEW
+        if key == "adm_toggle_dllock":
             CONFIG["download_lock"] = not CONFIG.get("download_lock", True)
             save_config(CONFIG)
-            return await cb.message.edit_text("Admin Panel (updated)", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
 
-        if key == "adm_toggle_enfadm":  # NEW
+        if key == "adm_toggle_enfadm":
             CONFIG["enforce_for_admins"] = not CONFIG.get("enforce_for_admins", False)
             save_config(CONFIG)
-            return await cb.message.edit_text("Admin Panel (updated)", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
 
         if key == "adm_channels":
             chs = CONFIG.get("required_channels", [])
             desc = ("Required Channels\n" + ("\n".join(f"- {c}" for c in chs) if chs else "None"))
-            return await cb.message.edit_text(desc, reply_markup=channels_kb())
+            return await safe_edit(cb.message, desc, reply_markup=channels_kb())
 
         if key == "adm_addchan":
             ADMIN_WAIT[cb.from_user.id] = "add_channel"
@@ -665,11 +692,11 @@ async def handle_callback(client, cb):
             await cb.answer("Removed.")
             chs = CONFIG.get("required_channels", [])
             desc = ("Required Channels\n" + ("\n".join(f"- {c}" for c in chs) if chs else "None"))
-            return await cb.message.edit_text(desc, reply_markup=channels_kb())
+            return await safe_edit(cb.message, desc, reply_markup=channels_kb())
 
         if key == "adm_invite":
             cur = CONFIG.get("invite_link") or "None"
-            return await cb.message.edit_text(f"Invite Link: {cur}", reply_markup=invite_kb(), disable_web_page_preview=True)
+            return await safe_edit(cb.message, f"Invite Link: {cur}", reply_markup=invite_kb(), disable_web_page_preview=True)
 
         if key == "adm_setinv":
             ADMIN_WAIT[cb.from_user.id] = "set_invite"
@@ -681,7 +708,7 @@ async def handle_callback(client, cb):
             save_config(CONFIG)
             await cb.answer("Cleared.")
             cur = CONFIG.get("invite_link") or "None"
-            return await cb.message.edit_text(f"Invite Link: {cur}", reply_markup=invite_kb(), disable_web_page_preview=True)
+            return await safe_edit(cb.message, f"Invite Link: {cur}", reply_markup=invite_kb(), disable_web_page_preview=True)
 
         if key == "adm_bcast":
             ADMIN_WAIT[cb.from_user.id] = "broadcast"
@@ -702,7 +729,7 @@ async def handle_callback(client, cb):
                 f"Stats\n• Users: {len(users)}\n• Downloads: {dls}\n"
                 f"• Cache: {hits} hit(s), {misses} miss(es)\n• Last Reset: {last}"
             )
-            return await cb.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(
+            return await safe_edit(cb.message, txt, reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔄 Reset Counters", callback_data="adm_resetdls")],
                  [InlineKeyboardButton("⬅️ Back", callback_data="adm_back")]]
             ))
@@ -711,12 +738,12 @@ async def handle_callback(client, cb):
             CONFIG["stats"]["downloads"] = 0
             CONFIG["stats"]["cache_hits"] = 0
             CONFIG["stats"]["cache_misses"] = 0
-            CONFIG["stats"]["last_reset"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            CONFIG["stats"]["last_reset"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             save_config(CONFIG)
-            return await cb.message.edit_text("✅ Counters reset.", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "✅ Counters reset.", reply_markup=admin_main_kb())
 
         if key == "adm_admins":
-            return await cb.message.edit_text("Admins", reply_markup=admins_kb())
+            return await safe_edit(cb.message, "Admins", reply_markup=admins_kb())
 
         if key == "adm_addadmin":
             ADMIN_WAIT[cb.from_user.id] = "add_admin"
@@ -729,12 +756,12 @@ async def handle_callback(client, cb):
             CONFIG["admins"] = arr
             save_config(CONFIG)
             await cb.answer("Removed.")
-            return await cb.message.edit_text("Admins (updated)", reply_markup=admins_kb())
+            return await safe_edit(cb.message, "Admins (updated)", reply_markup=admins_kb())
 
         if key == "adm_wl":
             lst = CONFIG.get("whitelist", [])
             view = "None" if not lst else "\n".join(f"- {u}" for u in lst)
-            return await cb.message.edit_text(f"Whitelist Users (IDs):\n{view}", reply_markup=whitelist_kb())
+            return await safe_edit(cb.message, f"Whitelist Users (IDs):\n{view}", reply_markup=whitelist_kb())
 
         if key == "adm_wl_add":
             ADMIN_WAIT[cb.from_user.id] = "wl_add"
@@ -747,7 +774,7 @@ async def handle_callback(client, cb):
                                           reply_markup=ForceReply(selective=True, placeholder="123456789"))
 
         if key == "adm_back":
-            return await cb.message.edit_text("Admin Panel", reply_markup=admin_main_kb())
+            return await safe_edit(cb.message, "Admin Panel", reply_markup=admin_main_kb())
 
     # ---- BROADCAST SEGMENT & SCHEDULE ----
     if data.startswith("bseg_") and is_admin(user_id):
@@ -757,11 +784,11 @@ async def handle_callback(client, cb):
         if data == "bseg_cancel":
             BCAST_DRAFT.pop(user_id, None)
             ADMIN_WAIT.pop(user_id, None)
-            return await cb.message.edit_text("❌ Broadcast cancelled.")
+            return await safe_edit(cb.message, "❌ Broadcast cancelled.")
 
         users_all = [int(u) for u in CONFIG["stats"].get("users", [])]
         last_seen = CONFIG["stats"].get("last_seen", {})
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if data == "bseg_all":
             target = users_all
@@ -774,7 +801,8 @@ async def handle_callback(client, cb):
                     continue
                 try:
                     seen = datetime.fromisoformat(iso.replace("Z", ""))
-                    if (now - seen) <= timedelta(days=7):
+                    # if stored with 'Z', replace above handles; if ISO with offset, it still parses
+                    if (now - (seen.replace(tzinfo=timezone.utc) if seen.tzinfo is None else seen)) <= timedelta(days=7):
                         target.append(u)
                 except Exception:
                     continue
@@ -788,7 +816,8 @@ async def handle_callback(client, cb):
         BCAST_DRAFT[user_id]["target"] = target
         BCAST_DRAFT[user_id]["segment_label"] = label
         ADMIN_WAIT[user_id] = "broadcast_schedule"
-        return await cb.message.edit_text(
+        return await safe_edit(
+            cb.message,
             f"Segment selected: {label}\n\nChoose when to send:",
             reply_markup=bcast_schedule_kb()
         )
@@ -800,7 +829,7 @@ async def handle_callback(client, cb):
         if data == "bsched_cancel":
             BCAST_DRAFT.pop(user_id, None)
             ADMIN_WAIT.pop(user_id, None)
-            return await cb.message.edit_text("❌ Broadcast cancelled.")
+            return await safe_edit(cb.message, "❌ Broadcast cancelled.")
 
         # Schedule delta
         delay = 0
@@ -857,7 +886,7 @@ async def handle_callback(client, cb):
                 BCAST_DRAFT.pop(user_id, None)
 
         asyncio.create_task(run_broadcast())
-        return await cb.message.edit_text(f"📢 Scheduled: {when}. You’ll get a summary after delivery.")
+        return await safe_edit(cb.message, f"📢 Scheduled: {when}. You’ll get a summary after delivery.")
 
     # ---- VIDEO: fetch info ----
     if data.startswith("video|"):
@@ -953,7 +982,7 @@ async def handle_callback(client, cb):
         if not url:
             return await cb.message.reply("❌ Session expired. Send the link again.")
 
-        # 🔒 DOWNLOAD LOCK (only if enabled)
+        # 🔒 DOWNLOAD LOCK
         if CONFIG.get("download_lock", True):
             if not await is_member_of_required_channels(client, user_id):
                 req = ", ".join([str(x) for x in CONFIG.get("required_channels", [])]) or "None"
@@ -1031,7 +1060,7 @@ async def handle_callback(client, cb):
                     # size guard
                     try:
                         if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                            await status.edit("⚠️ File is larger than 2 GB. Please try a lower resolution.")
+                            await safe_edit(status, "⚠️ File is larger than 2 GB. Please try a lower resolution.")
                             return
                     except Exception:
                         pass
@@ -1085,7 +1114,7 @@ async def handle_callback(client, cb):
 
             except Exception:
                 try:
-                    await status.edit("❌ Something went wrong. Please try again.")
+                    await safe_edit(status, "❌ Something went wrong. Please try again.")
                 except Exception:
                     pass
             finally:
@@ -1127,7 +1156,7 @@ async def handle_callback(client, cb):
         if not url:
             return await cb.message.reply("❌ Session expired. Send the link again.")
 
-        # 🔒 DOWNLOAD LOCK (only if enabled)
+        # 🔒 DOWNLOAD LOCK
         if CONFIG.get("download_lock", True):
             if not await is_member_of_required_channels(client, user_id):
                 req = ", ".join([str(x) for x in CONFIG.get("required_channels", [])]) or "None"
@@ -1213,7 +1242,7 @@ async def handle_callback(client, cb):
 
             except Exception:
                 try:
-                    await status.edit("❌ Something went wrong. Please try again.")
+                    await safe_edit(status, "❌ Something went wrong. Please try again.")
                 except Exception:
                     pass
             finally:
