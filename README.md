@@ -62,6 +62,20 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+and 
+
+pkg update && pkg upgrade -y
+pkg install python ffmpeg -y
+
+cd ~/Youtube-Downloader-Bot
+python -m venv .venv
+source .venv/bin/activate          # activate
+python -m pip install --upgrade pip wheel
+pip install -r requirements.txt     # agar file hai
+# ya
+pip install pyrogram tgcrypto yt-dlp requests
+
+python YouTubeDownloaderBot.py
 
 ### macOS
 ```bash
