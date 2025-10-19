@@ -3,17 +3,28 @@
 # Requires: pyrogram tgcrypto yt-dlp requests
 # NOTE: Only download content you have rights for.
 
+# --- Windows + Python 3.14: ensure an event loop exists BEFORE importing pyrogram
+import sys, asyncio
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import os
 import re
-import json
 import time
 import glob
 import hashlib
-import asyncio
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import wraps
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
+from collections import deque
 
 import yt_dlp
 from pyrogram import Client, filters, enums
@@ -39,28 +50,17 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ================== CONFIG (direct in Python; no JSON file) ==================
 CONFIG = {
-    # Gate on /start:
     "force_join": False,
-
-    # Add your required channels here: use @username or -100ID
     "required_channels": [],
-
-    # For private channels, set a permanent invite link. For public groups/channels you can keep None.
     "invite_link": None,
 
-    # Admins (Telegram numeric IDs)
     "admins": [8070535163],
-
-    # Admin enforcement:
-    # If admin_bypass=False and enforce_for_admins=True, even admins must join required channels.
     "admin_bypass": True,
     "enforce_for_admins": False,
 
-    # Maintenance mode & whitelist
     "maintenance_mode": False,
     "whitelist": [],
 
-    # Stats (kept in-memory only)
     "stats": {
         "users": [],
         "downloads": 0,
@@ -70,27 +70,40 @@ CONFIG = {
         "last_seen": {}
     },
 
-    # Cache config
     "cache_ttl_days": 7,
+    "download_lock": False,
 
-    # Gate right before sending downloads:
-    "download_lock": False
+    # exposed in /admin → Parallel Limit
+    "global_parallel_limit": 5,
+
+    # ===== Credits + Referral + Gift Codes =====
+    "user_credits": {},       # {user_id(str): int}
+    "ref_credit_reward": 1,   # referral: credits to referrer
+    "self_credit_reward": 1,  # referral: credits to new user
+    "fastpass_cost": 1,       # cost per Fast Pass
+    "gift_codes": {},         # "CODE": {"credits": int, "max_uses": int, "used_by": [user_id(str)]}
 }
 
-# No-op saver so existing calls won't crash (we're not persisting to disk now).
 def save_config(_cfg):
-    # Intentionally do nothing (no JSON persistence)
+    # No persistence (add JSON save if you want persistence across restarts)
     pass
 
 # ================== IN-MEMORY STATE ==================
-url_store: Dict[str, str] = {}          # link_uid -> url
-active_tasks: Dict[int, Dict[str, Optional[str]]] = {}   # download_msg_id -> {file, thumb}
-user_queues: Dict[int, asyncio.Queue] = {}               # user_id -> queue
-user_tasks: Dict[int, asyncio.Task] = {}                 # user_id -> current task
-user_locks: Dict[int, asyncio.Lock] = {}                 # user_id -> lock
-last_click_at: Dict[Tuple[int, str], float] = {}         # (user_id, key) -> ts
-ADMIN_WAIT: Dict[int, str] = {}                          # admin pending action
-BCAST_DRAFT: Dict[int, dict] = {}                        # admin id -> broadcast draft
+url_store: Dict[str, str] = {}                       # link_uid -> url
+active_tasks: Dict[int, Dict[str, Optional[str]]] = {}  # msg_id -> {file, thumb}
+user_queues: Dict[int, asyncio.Queue] = {}           # user_id -> queue
+user_tasks: Dict[int, asyncio.Task] = {}             # user_id -> current task
+user_locks: Dict[int, asyncio.Lock] = {}             # user_id -> lock
+last_click_at: Dict[Tuple[int, str], float] = {}     # (user_id, key) -> ts
+ADMIN_WAIT: Dict[int, str] = {}                      # pending action (admin + some user waits)
+BCAST_DRAFT: Dict[int, dict] = {}                    # admin id -> broadcast draft
+REDEEM_WAIT = set()                                  # user_ids waiting to send redeem code
+
+# --- Global N-slot download gate + live queue with priority lanes ---
+GLOBAL_DL_SEM = asyncio.Semaphore(int(CONFIG.get("global_parallel_limit", 5)))
+FAST_QUEUE = deque()     # (job_id, user_id, link_uid, kind)
+NORMAL_QUEUE = deque()
+NEXT_JOB_ID = 0
 
 # ================== HELPERS ==================
 def is_admin(user_id: int) -> bool:
@@ -110,11 +123,7 @@ def add_user_stat(user_id: int):
     if user_id not in users:
         users.add(user_id)
         CONFIG["stats"]["users"] = list(users)
-    # update last_seen (UTC aware)
-    try:
-        CONFIG["stats"]["last_seen"][str(user_id)] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    except Exception:
-        pass
+    CONFIG["stats"]["last_seen"][str(user_id)] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_config(CONFIG)
 
 def inc_downloads(n=1):
@@ -150,7 +159,7 @@ def download_thumbnail(url, path):
     return None
 
 def clean_youtube_url(url: str) -> str:
-    # normalize Shorts URLs
+    # normalize Shorts
     return url.replace("youtube.com/shorts/", "youtube.com/watch?v=")
 
 def retry(times=3, delay=3):
@@ -169,6 +178,49 @@ def retry(times=3, delay=3):
                         raise
         return wrapper
     return dec
+
+# ---- Credits helpers ----
+def get_credits(uid: int) -> int:
+    """
+    Return credits for a user.
+    Admins have effectively 'unlimited' credits represented by a very large integer.
+    """
+    try:
+        if is_admin(uid):
+            return 10**9
+        return int(CONFIG["user_credits"].get(str(uid), 0))
+    except Exception:
+        return 0
+
+def add_credits(uid: int, amount: int):
+    """
+    Add credits to a user. For admins this is a no-op.
+    """
+    try:
+        if is_admin(uid):
+            return
+        CONFIG["user_credits"][str(uid)] = get_credits(uid) + int(amount)
+        save_config(CONFIG)
+    except Exception:
+        pass
+
+def spend_credit(uid: int, n: int = None) -> bool:
+    """
+    Spend credits from a user. Admins always succeed.
+    Returns True if spent (or admin), False if insufficient.
+    """
+    try:
+        if is_admin(uid):
+            return True
+        cost = int(CONFIG.get("fastpass_cost", 1)) if n is None else int(n)
+        cur = get_credits(uid)
+        if cur >= cost:
+            CONFIG["user_credits"][str(uid)] = cur - cost
+            save_config(CONFIG)
+            return True
+        return False
+    except Exception:
+        return False
 
 async def enqueue_task(user_id, task_coro):
     if user_id not in user_queues:
@@ -197,16 +249,11 @@ async def user_worker(user_id):
             user_queues.pop(user_id, None)
             break
 
-# Robust safe edit: avoids MESSAGE_NOT_MODIFIED, updates keyboard-only when needed
 async def safe_edit(msg: Message, text: Optional[str] = None, reply_markup: Optional[InlineKeyboardMarkup] = None, **kwargs):
     try:
         current_text = getattr(msg, "text", None) or getattr(msg, "caption", None)
-
-        # Keyboard-only update
         if text is None:
             return await msg.edit_reply_markup(reply_markup=reply_markup)
-
-        # If text is identical, try updating only the keyboard; otherwise skip
         if current_text == text:
             if reply_markup is not None:
                 try:
@@ -214,14 +261,10 @@ async def safe_edit(msg: Message, text: Optional[str] = None, reply_markup: Opti
                 except MessageNotModified:
                     return msg
             return msg
-
-        # Normal edit
         return await msg.edit_text(text, reply_markup=reply_markup, **kwargs)
-
     except MessageNotModified:
         return msg
     except Exception:
-        # swallow benign races
         return msg
 
 def is_fast_double_click(user_id: int, key: str, min_gap=0.35) -> bool:
@@ -231,18 +274,9 @@ def is_fast_double_click(user_id: int, key: str, min_gap=0.35) -> bool:
     return (now - prev) < min_gap
 
 def parse_buttons_from_text(text: str) -> Optional[InlineKeyboardMarkup]:
-    """
-    Parse a simple "[Buttons]" block:
-    Example:
-        New update is live! 🚀
-
-        [Buttons]
-        Website | https://example.com
-        Join Channel | https://t.me/yourchannel
-    """
     if not text or "[Buttons]" not in text:
         return None
-    head, btns = text.split("[Buttons]", 1)
+    _, btns = text.split("[Buttons]", 1)
     rows = []
     for line in btns.strip().splitlines():
         if "|" in line:
@@ -252,7 +286,6 @@ def parse_buttons_from_text(text: str) -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(rows) if rows else None
 
 def cleanup_cache(ttl_days: int = None):
-    """Remove cache files older than TTL days."""
     ttl = ttl_days or int(CONFIG.get("cache_ttl_days", 7))
     cutoff = time.time() - (ttl * 86400)
     removed = 0
@@ -266,19 +299,59 @@ def cleanup_cache(ttl_days: int = None):
     if removed:
         print(f"[CACHE] Cleaned {removed} old file(s)")
 
+# ========== GLOBAL QUEUE WITH LIVE POSITION (PRIORITY) ==========
+async def enter_global_queue_live(user_id: int, link_uid: str, kind: str, make_msg, priority: bool = False):
+    """Place a job in the global queue (fast or normal). Show live position until a slot is acquired."""
+    global NEXT_JOB_ID, FAST_QUEUE, NORMAL_QUEUE, GLOBAL_DL_SEM
+    NEXT_JOB_ID += 1
+    job_id = NEXT_JOB_ID
+    lane = FAST_QUEUE if priority else NORMAL_QUEUE
+    lane.append((job_id, user_id, link_uid, kind))
+
+    def pos_of(jid: int) -> str:
+        for idx, (j, *_rest) in enumerate(FAST_QUEUE, start=1):
+            if j == jid:
+                return f"FAST #{idx}"
+        base = len(FAST_QUEUE)
+        for idx, (j, *_rest) in enumerate(NORMAL_QUEUE, start=1):
+            if j == jid:
+                return f"#{base + idx}"
+        return "—"
+
+    queued_msg = await make_msg(f"⏳ Added to queue… Position: {pos_of(job_id)}")
+
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(GLOBAL_DL_SEM.acquire(), timeout=0.05)
+                target_queue = FAST_QUEUE if FAST_QUEUE else NORMAL_QUEUE
+                if target_queue and target_queue[0][0] == job_id:
+                    target_queue.popleft()
+                    await safe_edit(queued_msg, "✅ Your turn! Starting…")
+                    return job_id, queued_msg
+                else:
+                    GLOBAL_DL_SEM.release()
+            except asyncio.TimeoutError:
+                pass
+
+            await asyncio.sleep(1.0)
+            try:
+                await safe_edit(queued_msg, f"⏳ Queue… Position: {pos_of(job_id)}")
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        try:
+            FAST_QUEUE = deque([x for x in FAST_QUEUE if x[0] != job_id])
+            NORMAL_QUEUE = deque([x for x in NORMAL_QUEUE if x[0] != job_id])
+        except Exception:
+            pass
+        raise
+
 # ================== FORCE-JOIN (JOIN GATE) ==================
 def join_kb():
-    """
-    Multi-channel join UI:
-    - One "Join <channel>" button per required channel
-    - Recheck button at the end
-    If channel is '@username' → https://t.me/username
-    If '-100...' (ID)       → use invite_link or fallback to https://t.me/
-    """
     chans = CONFIG.get("required_channels", [])
     buttons = []
     for ch in chans:
-        url = None
         if isinstance(ch, str) and ch.startswith("@"):
             url = "https://t.me/" + ch.lstrip("@")
         elif str(ch).startswith("-100"):
@@ -292,7 +365,7 @@ def join_kb():
 VALID_STATUSES = {
     enums.ChatMemberStatus.MEMBER,
     enums.ChatMemberStatus.ADMINISTRATOR,
-    enums.ChatMemberStatus.OWNER,  # (older name: CREATOR)
+    enums.ChatMemberStatus.OWNER,
 }
 
 async def _joined_in_chat(client: Client, chat: str, user_id: int) -> bool:
@@ -303,16 +376,12 @@ async def _joined_in_chat(client: Client, chat: str, user_id: int) -> bool:
         return False
     except UserNotParticipant:
         return False
-    except (ChannelPrivate, ChatAdminRequired, ChatIdInvalid, ChatWriteForbidden):
-        # Bot cannot verify; fail-closed so user is asked to join via invite link
+    except (ChannelPrivate, ChatAdminRequired, ChatWriteForbidden, ChatIdInvalid):
         return False
     except Exception:
         return False
 
 async def is_user_member(client: Client, user_id: int) -> bool:
-    """
-    Gate used on /start (respects CONFIG.force_join).
-    """
     if not CONFIG.get("force_join", True):
         return True
     chans = CONFIG.get("required_channels", [])
@@ -324,14 +393,8 @@ async def is_user_member(client: Client, user_id: int) -> bool:
     return True
 
 async def is_member_of_required_channels(client: Client, user_id: int) -> bool:
-    """
-    Download Lock checker with admin enforcement.
-    Admins bypass only if admin_bypass=True and enforce_for_admins=False.
-    """
-    # Admin bypass logic:
     if is_admin(user_id) and CONFIG.get("admin_bypass", True) and not CONFIG.get("enforce_for_admins", False):
         return True
-
     chans = CONFIG.get("required_channels", [])
     if not chans:
         return True
@@ -347,22 +410,48 @@ def _log(msg):
     except Exception:
         pass
 
+def welcome_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 My Credits", callback_data="credits_menu")],
+        [InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref_menu")]
+    ])
+
 @bot.on_message(filters.command("start", prefixes=["/"]) & filters.private)
 async def start_cmd(client, message):
-    """Clean welcome with pre-applied force-join gate."""
     _log(f"/start from {message.from_user.id} ({message.from_user.first_name})")
 
     uid = message.from_user.id
     is_adm = is_admin(uid)
     is_wl = is_whitelisted(uid)
 
-    # Maintenance Mode gate (admins & whitelist bypass)
     if CONFIG.get("maintenance_mode", False) and not (is_adm or is_wl):
         return await message.reply("🛠 Under Maintenance\n\nWe’re upgrading the bot. Please try again later.")
 
+    # Parse referral BEFORE add_user_stat to detect first-time
+    parts = (message.text or "").split(maxsplit=1)
+    param = parts[1] if len(parts) > 1 else None
+    was_new = uid not in set(CONFIG["stats"].get("users", []))
+
+    # Referral deep-link
+    if param and param.startswith("ref_"):
+        try:
+            ref_id = int(param.split("_", 1)[1])
+            if ref_id != uid and was_new:
+                add_credits(uid, CONFIG.get("self_credit_reward", 1))
+                add_credits(ref_id, CONFIG.get("ref_credit_reward", 1))
+                try:
+                    await message.reply(
+                        f"🎉 Referral applied!\n"
+                        f"• You got +{CONFIG.get('self_credit_reward',1)} credit.\n"
+                        f"• Referrer {ref_id} got +{CONFIG.get('ref_credit_reward',1)} credit."
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     add_user_stat(uid)
 
-    # Force-Join gate (unless admin bypass)
     try:
         chans = CONFIG.get("required_channels", [])
         gate = CONFIG.get("force_join", True)
@@ -384,14 +473,13 @@ async def start_cmd(client, message):
     except Exception as e:
         _log(f"force-join check error: {e}")
 
-    # Clean, simple welcome
     return await message.reply(
         "✨ Welcome to YouTube Downloader\n"
         "🎥 Paste a YouTube link & get your video or audio instantly.\n\n"
-        "👇 Send your link below!"
+        "👇 Send your link below!",
+        reply_markup=welcome_kb()
     )
 
-# Fallback for odd clients that send 'start' text
 @bot.on_message((filters.regex(r"^/start(@[A-Za-z0-9_]+)?$") | filters.regex(r"^start$", re.IGNORECASE)) & filters.private)
 async def start_fallback(client, message):
     return await start_cmd(client, message)
@@ -407,12 +495,14 @@ def admin_main_kb():
                               callback_data="adm_toggle_dllock")],
         [InlineKeyboardButton("👮 Enforce for Admins: " + ("ON ✅" if CONFIG.get("enforce_for_admins", False) else "OFF ❌"),
                               callback_data="adm_toggle_enfadm")],
+        [InlineKeyboardButton("⏫ Parallel Limit", callback_data="adm_conc")],
         [InlineKeyboardButton("🧪 Whitelist", callback_data="adm_wl")],
         [InlineKeyboardButton("📢 Required Channels", callback_data="adm_channels"),
          InlineKeyboardButton("🔗 Invite Link", callback_data="adm_invite")],
         [InlineKeyboardButton("📬 Broadcast", callback_data="adm_bcast"),
          InlineKeyboardButton("📊 Stats", callback_data="adm_stats")],
-        [InlineKeyboardButton("🔧 Admins", callback_data="adm_admins")]
+        [InlineKeyboardButton("🔧 Admins", callback_data="adm_admins")],
+        [InlineKeyboardButton("🎁 Gift Codes", callback_data="adm_gift")]
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -438,6 +528,17 @@ def admins_kb():
         rows.append([InlineKeyboardButton(f"❌ Remove {uid}", callback_data=f"adm_remadmin|{uid}")])
     rows.append([InlineKeyboardButton("➕ Add Admin", callback_data="adm_addadmin"),
                  InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
+    return InlineKeyboardMarkup(rows)
+
+def concurrency_kb():
+    cur = int(CONFIG.get("global_parallel_limit", 5))
+    choices = [2, 3, 5, 8, 10]
+    rows = []
+    for n in choices:
+        label = f"{'• ' if n == cur else ''}{n}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"adm_setconc|{n}")])
+    rows.append([InlineKeyboardButton("✏️ Custom…", callback_data="adm_setconc_custom")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
     return InlineKeyboardMarkup(rows)
 
 def whitelist_kb():
@@ -478,24 +579,47 @@ async def admin_cmd(client, message):
         f"• Maintenance: {'ON' if CONFIG.get('maintenance_mode', False) else 'OFF'}\n"
         f"• Download Lock: {'ON' if CONFIG.get('download_lock', True) else 'OFF'}\n"
         f"• Enforce for Admins: {'ON' if CONFIG.get('enforce_for_admins', False) else 'OFF'}\n"
+        f"• Parallel Limit: {int(CONFIG.get('global_parallel_limit', 5))}\n"
         f"• Whitelist: {len(CONFIG.get('whitelist', []))} user(s)\n"
         f"• Channels: {', '.join([str(x) for x in CONFIG.get('required_channels', [])]) or 'None'}\n"
         f"• Invite: {CONFIG.get('invite_link') or 'None'}\n\n"
-        f"Stats\n• Users: {len(users)}\n• Downloads: {dls}\n• Cache: {hits} hit(s), {misses} miss(es)\n• Last Reset: {last}"
+        f"Stats\n• Users: {len(users)}\n• Downloads: {dls}\n"
+        f"• Cache: {hits} hit(s), {misses} miss(es)\n• Last Reset: {last}"
     )
     await message.reply(text, reply_markup=admin_main_kb(), disable_web_page_preview=True)
 
 @bot.on_message(filters.private & (filters.text | filters.media))
 async def catch_admin_inputs(client, message: Message):
-    """Captures ForceReply inputs for admin actions, then falls through to user flow."""
     uid = message.from_user.id
     intent = ADMIN_WAIT.get(uid)
 
-    # Maintenance mode block for non-admins (whitelist allowed)
     if CONFIG.get("maintenance_mode", False) and not (is_admin(uid) or is_whitelisted(uid)):
         return await message.reply("🛠 Under Maintenance\n\nPlease try again later.")
 
     add_user_stat(uid)
+
+    # ====== USER REDEEM WAIT ======
+    if uid in REDEEM_WAIT:
+        code_text = (message.text or message.caption or "").strip().upper()
+        REDEEM_WAIT.discard(uid)
+        if not code_text:
+            return await message.reply("❌ Please send a valid code (e.g., WELCOME2025).")
+        gift = CONFIG.get("gift_codes", {}).get(code_text)
+        if not gift:
+            return await message.reply("❌ Invalid or expired code.")
+        if str(uid) in gift.get("used_by", []):
+            return await message.reply("⚠️ You already used this code.")
+        max_uses = int(gift.get("max_uses", 0))
+        if max_uses and len(gift.get("used_by", [])) >= max_uses:
+            return await message.reply("❌ This code has reached its maximum uses.")
+        credits = int(gift.get("credits", 0))
+        add_credits(uid, credits)
+        gift.setdefault("used_by", []).append(str(uid))
+        save_config(CONFIG)
+        remaining = (gift["max_uses"] - len(gift["used_by"])) if max_uses else "∞"
+        return await message.reply(
+            f"🎉 Code Redeemed!\nYou received +{credits} credits 💳\nCode: {code_text}\nRemaining Uses: {remaining}"
+        )
 
     # ====== ADMIN INTENTS ======
     if intent and is_admin(uid):
@@ -527,12 +651,11 @@ async def catch_admin_inputs(client, message: Message):
             return
 
         if intent == "broadcast":
-            # Accept text or media; store draft; ask for segment
             draft = {
                 "type": "text",
                 "text": txt,
                 "buttons": parse_buttons_from_text(txt),
-                "media": None,  # {'kind': 'photo'|'video'|'doc', 'file_id': ..., 'caption': str}
+                "media": None,
             }
             if message.photo:
                 draft["type"] = "photo"
@@ -589,13 +712,56 @@ async def catch_admin_inputs(client, message: Message):
             ADMIN_WAIT.pop(uid, None)
             return
 
-    # ====== FALL THROUGH: Normal user flow ======
+        if intent == "set_conc":
+            txt_clean = (message.text or "").strip()
+            try:
+                val = int(txt_clean)
+                if val <= 0:
+                    raise ValueError
+                CONFIG["global_parallel_limit"] = val
+                save_config(CONFIG)
+                global GLOBAL_DL_SEM
+                GLOBAL_DL_SEM = asyncio.Semaphore(val)
+                await message.reply(f"✅ Parallel limit updated to: {val}")
+            except Exception:
+                await message.reply("❌ Invalid value. Please send a positive integer (e.g., 5).")
+            ADMIN_WAIT.pop(uid, None)
+            return
+
+        if intent == "gift_code":
+            try:
+                code, credits, max_uses = [x.strip() for x in txt.split("|")]
+                code = code.upper()
+                CONFIG["gift_codes"][code] = {"credits": int(credits), "max_uses": int(max_uses), "used_by": []}
+                save_config(CONFIG)
+                await message.reply(
+                    f"✅ Gift Code Generated:\n"
+                    f"Code: {code}\nCredits: {credits}\nMax Uses: {max_uses}"
+                )
+            except Exception:
+                await message.reply("❌ Invalid format. Example: WELCOME2025|5|10")
+            ADMIN_WAIT.pop(uid, None)
+            return
+
+        if intent == "gift_revoke":
+            code = txt.strip().upper()
+            codes = CONFIG.get("gift_codes", {})
+            if code in codes:
+                codes.pop(code, None)
+                save_config(CONFIG)
+                await message.reply(f"✅ Gift code revoked: {code}")
+            else:
+                await message.reply("❌ Code not found.")
+            ADMIN_WAIT.pop(uid, None)
+            return
+
+    # ====== FALL THROUGH: Normal user flow (link handling) ======
     raw = (message.text or message.caption or "").strip()
     if not raw:
         return
     url = clean_youtube_url(raw)
     if "youtube.com/watch?v=" not in url and "youtu.be" not in url:
-        return  # ignore non-YouTube text/media
+        return
 
     link_uid = hash_url(url)[:10]
     url_store[link_uid] = url
@@ -621,15 +787,13 @@ async def handle_callback(client, cb):
     data = cb.data or ""
     user_id = cb.from_user.id
 
-    # Maintenance mode block for non-admins (whitelist allowed)
     if CONFIG.get("maintenance_mode", False) and not (is_admin(user_id) or is_whitelisted(user_id)):
         try:
             return await cb.message.reply("🛠 Under Maintenance\n\nPlease try again later.")
         except Exception:
             return
 
-    # debounce ultra-fast taps
-    parts = data.split("|", 2)
+    parts = data.split("|", 3)
     key = parts[0] + (parts[1] if len(parts) > 1 else "")
     if is_fast_double_click(user_id, key):
         return
@@ -645,6 +809,53 @@ async def handle_callback(client, cb):
                 reply_markup=join_kb(),
                 disable_web_page_preview=True
             )
+
+    # ---- PUBLIC MENUS ----
+    if data == "credits_menu":
+        bal = get_credits(user_id)
+        bal_str = "∞" if is_admin(user_id) else str(bal)
+        return await safe_edit(cb.message,
+            f"💳 Your Credits: {bal_str}\n"
+            "⚡ Each Fast Pass costs 1 credit.\n"
+            "🕒 Use Normal Queue (free) if you don’t want to spend credits.\n",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref_menu")],
+                [InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_open")],
+                [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
+            ])
+        )
+
+    if data == "ref_menu":
+        me = await client.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{user_id}" if me.username else "Bot username not set."
+        return await safe_edit(cb.message,
+            "🎁 Earn Free Credits!\n\n"
+            f"🔗 Your Personal Invite Link:\n{link}\n\n"
+            "👥 When a friend joins using your link:\n"
+            f"• You earn +{CONFIG.get('ref_credit_reward',1)} credit 🎉\n"
+            f"• Your friend gets +{CONFIG.get('self_credit_reward',1)} credit 🆓\n\n"
+            "⚡ More credits = Faster downloads with Fast Pass!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 My Credits", callback_data="credits_menu")],
+                [InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_open")],
+                [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
+            ])
+        )
+
+    if data == "redeem_open":
+        REDEEM_WAIT.add(user_id)
+        return await cb.message.reply(
+            "🎟️ Enter your gift code to redeem:\n💡 Example: WELCOME2025",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]])
+        )
+
+    if data == "back_menu":
+        return await safe_edit(cb.message,
+            "✨ Welcome to YouTube Downloader\n"
+            "🎥 Paste a YouTube link & get your video or audio instantly.\n\n"
+            "👇 Send your link below!",
+            reply_markup=welcome_kb()
+        )
 
     # ---- ADMIN PANEL ----
     if data.startswith("adm_"):
@@ -672,6 +883,31 @@ async def handle_callback(client, cb):
             CONFIG["enforce_for_admins"] = not CONFIG.get("enforce_for_admins", False)
             save_config(CONFIG)
             return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
+
+        if key == "adm_conc":
+            return await safe_edit(cb.message, "Set max parallel downloads:", reply_markup=concurrency_kb())
+
+        if key == "adm_setconc_custom":
+            ADMIN_WAIT[cb.from_user.id] = "set_conc"
+            return await cb.message.reply(
+                "Send the maximum number of parallel downloads (integer > 0):",
+                reply_markup=ForceReply(selective=True, placeholder="e.g., 6")
+            )
+
+        if key.startswith("adm_setconc|"):
+            try:
+                _, n = key.split("|", 1)
+                n = int(n)
+                if n <= 0:
+                    raise ValueError
+                CONFIG["global_parallel_limit"] = n
+                save_config(CONFIG)
+                global GLOBAL_DL_SEM
+                GLOBAL_DL_SEM = asyncio.Semaphore(n)
+                await cb.answer(f"Updated: {n} parallel downloads")
+                return await safe_edit(cb.message, "Admin Panel (updated)", reply_markup=admin_main_kb())
+            except Exception:
+                return await cb.answer("Invalid value", show_alert=True)
 
         if key == "adm_channels":
             chs = CONFIG.get("required_channels", [])
@@ -726,8 +962,12 @@ async def handle_callback(client, cb):
             misses = CONFIG["stats"].get("cache_misses", 0)
             last = CONFIG["stats"].get("last_reset") or "Never"
             txt = (
-                f"Stats\n• Users: {len(users)}\n• Downloads: {dls}\n"
-                f"• Cache: {hits} hit(s), {misses} miss(es)\n• Last Reset: {last}"
+                "Stats\n"
+                f"• Users: {len(users)}\n"
+                f"• Downloads: {dls}\n"
+                f"• Parallel Limit: {int(CONFIG.get('global_parallel_limit', 5))}\n"
+                f"• Cache: {hits} hit(s), {misses} miss(es)\n"
+                f"• Last Reset: {last}"
             )
             return await safe_edit(cb.message, txt, reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔄 Reset Counters", callback_data="adm_resetdls")],
@@ -751,8 +991,8 @@ async def handle_callback(client, cb):
                                           reply_markup=ForceReply(selective=True, placeholder="123456789"))
 
         if key.startswith("adm_remadmin|"):
-            _, uid = key.split("|", 1)
-            arr = [x for x in CONFIG.get("admins", []) if str(x) != str(uid)]
+            _, uid_str = key.split("|", 1)
+            arr = [x for x in CONFIG.get("admins", []) if str(x) != str(uid_str)]
             CONFIG["admins"] = arr
             save_config(CONFIG)
             await cb.answer("Removed.")
@@ -776,117 +1016,43 @@ async def handle_callback(client, cb):
         if key == "adm_back":
             return await safe_edit(cb.message, "Admin Panel", reply_markup=admin_main_kb())
 
-    # ---- BROADCAST SEGMENT & SCHEDULE ----
-    if data.startswith("bseg_") and is_admin(user_id):
-        draft = BCAST_DRAFT.get(user_id)
-        if not draft:
-            return await cb.answer("No draft. Start again.", show_alert=True)
-        if data == "bseg_cancel":
-            BCAST_DRAFT.pop(user_id, None)
+        # === Gift codes admin ===
+        if key == "adm_gift":
+            codes = CONFIG.get("gift_codes", {})
+            if not codes:
+                desc = "No active gift codes."
+            else:
+                desc = "Active Gift Codes:\n"
+                for code, data in codes.items():
+                    used = len(data.get("used_by", []))
+                    maxu = data.get("max_uses", '∞')
+                    desc += f"- {code} → {data.get('credits',0)} credits ({maxu} max, {used} used)\n"
+            return await safe_edit(cb.message, desc, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Generate New", callback_data="adm_gift_new")],
+                [InlineKeyboardButton("❌ Revoke Code", callback_data="adm_gift_revoke")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="adm_back")]
+            ]))
+
+        if key == "adm_gift_new":
+            ADMIN_WAIT[user_id] = "gift_code"
+            return await cb.message.reply(
+                "Send gift code and credits in format:\nCODE|CREDITS|MAX_USES\nExample:\nWELCOME2025|5|10",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="adm_back")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="adm_cancel")]
+                ])
+            )
+
+        if key == "adm_gift_revoke":
+            ADMIN_WAIT[user_id] = "gift_revoke"
+            return await cb.message.reply(
+                "Send the code you want to revoke.\nExample: WELCOME2025",
+                reply_markup=ForceReply(selective=True, placeholder="WELCOME2025")
+            )
+
+        if key == "adm_cancel":
             ADMIN_WAIT.pop(user_id, None)
-            return await safe_edit(cb.message, "❌ Broadcast cancelled.")
-
-        users_all = [int(u) for u in CONFIG["stats"].get("users", [])]
-        last_seen = CONFIG["stats"].get("last_seen", {})
-        now = datetime.now(timezone.utc)
-
-        if data == "bseg_all":
-            target = users_all
-            label = "All Users"
-        elif data == "bseg_active7":
-            target = []
-            for u in users_all:
-                iso = last_seen.get(str(u))
-                if not iso:
-                    continue
-                try:
-                    seen = datetime.fromisoformat(iso.replace("Z", ""))
-                    # if stored with 'Z', replace above handles; if ISO with offset, it still parses
-                    if (now - (seen.replace(tzinfo=timezone.utc) if seen.tzinfo is None else seen)) <= timedelta(days=7):
-                        target.append(u)
-                except Exception:
-                    continue
-            label = "Active (7d)"
-        elif data == "bseg_wl":
-            target = [int(x) for x in CONFIG.get("whitelist", [])]
-            label = "Whitelisted"
-        else:
-            return
-
-        BCAST_DRAFT[user_id]["target"] = target
-        BCAST_DRAFT[user_id]["segment_label"] = label
-        ADMIN_WAIT[user_id] = "broadcast_schedule"
-        return await safe_edit(
-            cb.message,
-            f"Segment selected: {label}\n\nChoose when to send:",
-            reply_markup=bcast_schedule_kb()
-        )
-
-    if data.startswith("bsched_") and is_admin(user_id):
-        draft = BCAST_DRAFT.get(user_id)
-        if not draft:
-            return await cb.answer("No draft. Start again.", show_alert=True)
-        if data == "bsched_cancel":
-            BCAST_DRAFT.pop(user_id, None)
-            ADMIN_WAIT.pop(user_id, None)
-            return await safe_edit(cb.message, "❌ Broadcast cancelled.")
-
-        # Schedule delta
-        delay = 0
-        if data == "bsched_15":
-            delay = 15 * 60
-        elif data == "bsched_60":
-            delay = 60 * 60
-        # "bsched_now" => delay = 0
-
-        ADMIN_WAIT.pop(user_id, None)
-        when = "Now" if delay == 0 else f"in {delay//60} min"
-
-        async def run_broadcast():
-            if delay > 0:
-                await asyncio.sleep(delay)
-            targets = draft.get("target", [])
-            ok, fail = 0, 0
-            start_ts = time.time()
-            markup = draft.get("buttons")
-            try:
-                for u in targets:
-                    try:
-                        if draft["type"] == "text":
-                            txt_clean = draft["text"]
-                            if txt_clean and "[Buttons]" in txt_clean:
-                                txt_clean = txt_clean.split("[Buttons]")[0].strip()
-                            await bot.send_message(u, txt_clean or "", reply_markup=markup, disable_web_page_preview=True)
-                        else:
-                            media = draft["media"]
-                            cap = (media.get("caption") or "")
-                            if "[Buttons]" in cap:
-                                cap = cap.split("[Buttons]")[0].strip()
-                            if media["kind"] == "photo":
-                                await bot.send_photo(u, media["file_id"], caption=cap, reply_markup=markup)
-                            elif media["kind"] == "video":
-                                await bot.send_video(u, media["file_id"], caption=cap, reply_markup=markup)
-                            elif media["kind"] == "doc":
-                                await bot.send_document(u, media["file_id"], caption=cap, reply_markup=markup)
-                            else:
-                                await bot.send_message(u, draft.get("text") or "")
-                        ok += 1
-                    except Exception:
-                        fail += 1
-            finally:
-                dur = time.time() - start_ts
-                try:
-                    await bot.send_message(
-                        user_id,
-                        f"📬 Broadcast Summary ({draft.get('segment_label','')}, {when})\n"
-                        f"✅ Delivered: {ok}\n⚠️ Failed: {fail}\n⏱ Duration: {int(dur)}s"
-                    )
-                except Exception:
-                    pass
-                BCAST_DRAFT.pop(user_id, None)
-
-        asyncio.create_task(run_broadcast())
-        return await safe_edit(cb.message, f"📢 Scheduled: {when}. You’ll get a summary after delivery.")
+            return await safe_edit(cb.message, "❌ Cancelled.", reply_markup=admin_main_kb())
 
     # ---- VIDEO: fetch info ----
     if data.startswith("video|"):
@@ -899,8 +1065,11 @@ async def handle_callback(client, cb):
 
         async def job():
             try:
-                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                def _get_info():
+                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                        return ydl.extract_info(url, download=False)
+
+                info = await asyncio.to_thread(_get_info)
                 title = info.get("title", "N/A")
                 duration = info.get("duration", 0)
                 channel = info.get("uploader", "Unknown")
@@ -952,7 +1121,7 @@ async def handle_callback(client, cb):
 
         await enqueue_task(user_id, job())
 
-    # ---- VIDEO: user picked quality -> choose format ----
+    # ---- VIDEO: choose format after quality ----
     elif data.startswith("res|"):
         try:
             _, quality, link_uid = data.split("|", 2)
@@ -962,27 +1131,35 @@ async def handle_callback(client, cb):
             f"💽 Selected {quality}\nChoose file format:",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("MP4 (Recommended)", callback_data=f"download|{quality}|mp4|{link_uid}"),
-                    InlineKeyboardButton("MKV (Alternative)", callback_data=f"download|{quality}|mkv|{link_uid}")
+                    InlineKeyboardButton("MP4 (Recommended)", callback_data=f"fmt|{quality}|mp4|{link_uid}"),
+                    InlineKeyboardButton("MKV (Alternative)", callback_data=f"fmt|{quality}|mkv|{link_uid}")
                 ],
                 [
-                    InlineKeyboardButton("WEBM (VP9/Opus)", callback_data=f"download|{quality}|webm|{link_uid}")
+                    InlineKeyboardButton("WEBM (VP9/Opus)", callback_data=f"fmt|{quality}|webm|{link_uid}")
                 ]
             ])
         )
 
-    # ---- VIDEO: download (with Smart Cache) + DOWNLOAD LOCK ----
-    elif data.startswith("download|"):
-        try:
-            _, quality, fmt, link_uid = data.split("|", 3)
-        except ValueError:
-            return
+    # ---- VIDEO: after format, let user choose Fast/Normal ----
+    elif data.startswith("fmt|"):
+        _, quality, fmt, link_uid = data.split("|", 3)
+        bal = get_credits(user_id)
+        return await cb.message.reply(
+            f"🎯 {quality.upper()} · {fmt.upper()}\nChoose queue mode:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⚡ Fast Pass (use {CONFIG.get('fastpass_cost',1)} credit)", callback_data=f"vfast|{quality}|{fmt}|{link_uid}")],
+                [InlineKeyboardButton("🕒 Normal Queue (free)", callback_data=f"vnorm|{quality}|{fmt}|{link_uid}")]
+            ])
+        )
 
+    # ---- VIDEO: download (fast) ----
+    elif data.startswith("vfast|") or data.startswith("vnorm|"):
+        fast = data.startswith("vfast|")
+        _, quality, fmt, link_uid = data.split("|", 3)
         url = url_store.get(link_uid)
         if not url:
             return await cb.message.reply("❌ Session expired. Send the link again.")
 
-        # 🔒 DOWNLOAD LOCK
         if CONFIG.get("download_lock", True):
             if not await is_member_of_required_channels(client, user_id):
                 req = ", ".join([str(x) for x in CONFIG.get("required_channels", [])]) or "None"
@@ -998,11 +1175,25 @@ async def handle_callback(client, cb):
         height_map = {"144p": 144, "240p": 240, "360p": 360, "480p": 480, "720p": 720, "1080p": 1080}
         max_h = height_map.get(quality, 720)
 
-        # Smart cache key for video
-        vkey = hash_url(f"{url}|{quality}|{fmt}")
-        cached_path = os.path.join(CACHE_DIR, f"{vkey}.{fmt}")
+        cache_key = hash_url(f"{url}|{quality}|{fmt}")
+        cached_path = os.path.join(CACHE_DIR, f"{cache_key}.{fmt}")
 
-        # If cached, send instantly
+        # Spend credit if Fast
+        priority = False
+        if fast:
+            if spend_credit(user_id, CONFIG.get("fastpass_cost", 1)):
+                await cb.message.reply(f"⚡ Fast Pass used (−{CONFIG.get('fastpass_cost',1)} credit). Jumping the queue…")
+                priority = True
+            else:
+                # Not enough credits
+                return await cb.message.reply(
+                    "❌ You don’t have enough credits.\nUse Normal Queue (free) or invite friends with /ref to earn credits.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🕒 Normal Queue (free)", callback_data=f"vnorm|{quality}|{fmt}|{link_uid}")],
+                        [InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref_menu")]
+                    ])
+                )
+
         if os.path.exists(cached_path):
             inc_cache(True)
             cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel|{link_uid}")]])
@@ -1033,13 +1224,19 @@ async def handle_callback(client, cb):
         ydl_format = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]"
         status = await cb.message.reply(f"🔄 Preparing {quality} {fmt.upper()}…")
 
+        # queue + acquire a slot
+        job_id, queued_msg = await enter_global_queue_live(
+            user_id, link_uid, kind="video",
+            make_msg=lambda text: cb.message.reply(text),
+            priority=priority
+        )
+
         async def job():
             thumb_path = None
-            file_path = None
             try:
                 ydl_opts = {
                     "format": ydl_format,
-                    "merge_output_format": fmt,  # mp4/mkv/webm
+                    "merge_output_format": fmt,
                     "outtmpl": "downloads/%(title)s.%(ext)s",
                     "quiet": True,
                     "no_warnings": True,
@@ -1047,37 +1244,44 @@ async def handle_callback(client, cb):
                     "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": fmt}],
                 }
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    file_path = ydl.prepare_filename(info)
-                    # ensure extension
-                    if not file_path.lower().endswith(f".{fmt}"):
-                        base = file_path.rsplit(".", 1)[0]
-                        alt = base + f".{fmt}"
-                        if os.path.exists(alt):
-                            file_path = alt
+                def _download_video():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        fp = ydl.prepare_filename(info)
+                        if not fp.lower().endswith(f".{fmt}"):
+                            base = fp.rsplit(".", 1)[0]
+                            alt = base + f".{fmt}"
+                            if os.path.exists(alt):
+                                fp = alt
+                        try:
+                            if os.path.getsize(fp) > MAX_FILE_SIZE:
+                                return {"oversize": True}, fp, None
+                        except Exception:
+                            pass
+                        try:
+                            if not os.path.exists(cached_path):
+                                os.replace(fp, cached_path)
+                                fp = cached_path
+                        except Exception:
+                            pass
+                        return info, fp, info.get("thumbnail")
 
-                    # size guard
-                    try:
-                        if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                            await safe_edit(status, "⚠️ File is larger than 2 GB. Please try a lower resolution.")
-                            return
-                    except Exception:
-                        pass
+                info, file_path, thumb_url = await asyncio.to_thread(_download_video)
 
-                    # move to cache for future hits
-                    try:
-                        if not os.path.exists(cached_path):
-                            os.replace(file_path, cached_path)
-                            file_path = cached_path
-                    except Exception:
-                        pass
+                # release slot after heavy work
+                try:
+                    GLOBAL_DL_SEM.release()
+                except Exception:
+                    pass
 
-                    thumb_url = info.get("thumbnail")
-                    if thumb_url:
-                        tpath = f"downloads/thumb_{link_uid}.jpg"
-                        if download_thumbnail(thumb_url, tpath):
-                            thumb_path = tpath
+                if isinstance(info, dict) and info.get("oversize"):
+                    await safe_edit(status, "⚠️ File is larger than 2 GB. Please try a lower resolution.")
+                    return
+
+                if thumb_url:
+                    tpath = f"downloads/thumb_{link_uid}.jpg"
+                    if download_thumbnail(thumb_url, tpath):
+                        thumb_path = tpath
 
                 cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel|{link_uid}")]])
                 download_msg = await cb.message.reply("📥 Downloading…\n" + progress_bar(0, 1), reply_markup=cancel_markup)
@@ -1123,6 +1327,11 @@ async def handle_callback(client, cb):
                         os.remove(thumb_path)
                     except Exception:
                         pass
+                try:
+                    if GLOBAL_DL_SEM.locked():
+                        GLOBAL_DL_SEM.release()
+                except Exception:
+                    pass
 
         await enqueue_task(user_id, job())
 
@@ -1146,7 +1355,7 @@ async def handle_callback(client, cb):
             ])
         )
 
-    # ---- AUDIO: download (with Smart Cache) + DOWNLOAD LOCK ----
+    # ---- AUDIO: download (cache + queue + lock) ----
     elif data.startswith("audio_dl|"):
         try:
             _, fmt, bitrate, link_uid = data.split("|", 3)
@@ -1156,7 +1365,6 @@ async def handle_callback(client, cb):
         if not url:
             return await cb.message.reply("❌ Session expired. Send the link again.")
 
-        # 🔒 DOWNLOAD LOCK
         if CONFIG.get("download_lock", True):
             if not await is_member_of_required_channels(client, user_id):
                 req = ", ".join([str(x) for x in CONFIG.get("required_channels", [])]) or "None"
@@ -1172,87 +1380,157 @@ async def handle_callback(client, cb):
         @retry()
         async def process_audio():
             status = await cb.message.reply("🔄 Preparing audio…")
-            file_id = hash_url(url + fmt + bitrate)
-            cached_path = os.path.join(CACHE_DIR, f"{file_id}.{fmt}")
-            thumb_path = None
 
-            try:
-                if os.path.exists(cached_path):
-                    inc_cache(True)
-                    await safe_edit(status, "✅ Found in cache. Sending…")
-                    file_path = cached_path
-                else:
-                    inc_cache(False)
-                    ydl_opts = {
-                        "format": "bestaudio/best",
-                        "outtmpl": "downloads/%(title)s.%(ext)s",
-                        "quiet": True,
-                        "no_warnings": True,
-                        "http_headers": {"User-Agent": "Mozilla/5.0"},
-                        "postprocessors": [{
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": fmt,
-                            "preferredquality": bitrate
-                        }]
-                    }
+            # Ask for Fast/Normal
+            bal = get_credits(user_id)
+            ask = await cb.message.reply(
+                f"🎯 {fmt.upper()} · {bitrate} kbps\nChoose queue mode:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"⚡ Fast Pass (use {CONFIG.get('fastpass_cost',1)} credit)", callback_data=f"afast|{fmt}|{bitrate}|{link_uid}")],
+                    [InlineKeyboardButton("🕒 Normal Queue (free)", callback_data=f"anorm|{fmt}|{bitrate}|{link_uid}")]
+                ])
+            )
+            return  # stop here; next callback continues
+
+        await enqueue_task(user_id, process_audio())
+
+    elif data.startswith("afast|") or data.startswith("anorm|"):
+        fast = data.startswith("afast|")
+        _, fmt, bitrate, link_uid = data.split("|", 3)
+        url = url_store.get(link_uid)
+        if not url:
+            return await cb.message.reply("❌ Session expired. Send the link again.")
+
+        if CONFIG.get("download_lock", True):
+            if not await is_member_of_required_channels(client, user_id):
+                req = ", ".join([str(x) for x in CONFIG.get("required_channels", [])]) or "None"
+                return await cb.message.reply(
+                    "🚫 Download Locked\n\n"
+                    "Please join the required channel(s) to unlock this download.\n"
+                    f"Required: {req}\n\n"
+                    "👉 After joining, tap “I’ve joined, Recheck”.",
+                    reply_markup=join_kb(),
+                    disable_web_page_preview=True
+                )
+
+        priority = False
+        if fast:
+            if spend_credit(user_id, CONFIG.get("fastpass_cost", 1)):
+                await cb.message.reply(f"⚡ Fast Pass used (−{CONFIG.get('fastpass_cost',1)} credit). Jumping the queue…")
+                priority = True
+            else:
+                return await cb.message.reply(
+                    "❌ You don’t have enough credits.\nUse Normal Queue (free) or invite friends with /ref to earn credits.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🕒 Normal Queue (free)", callback_data=f"anorm|{fmt}|{bitrate}|{link_uid}")],
+                        [InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref_menu")]
+                    ])
+                )
+
+        status = await cb.message.reply("🔄 Preparing audio…")
+
+        job_id, queued_msg = await enter_global_queue_live(
+            user_id, link_uid, kind="audio",
+            make_msg=lambda text: cb.message.reply(text),
+            priority=priority
+        )
+
+        cache_id = hash_url(url + fmt + bitrate)
+        cached_path = os.path.join(CACHE_DIR, f"{cache_id}.{fmt}")
+        thumb_path = None
+
+        try:
+            if os.path.exists(cached_path):
+                inc_cache(True)
+                await safe_edit(status, "✅ Found in cache. Sending…")
+                file_path = cached_path
+                thumb_url = None
+            else:
+                inc_cache(False)
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": "downloads/%(title)s.%(ext)s",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "http_headers": {"User-Agent": "Mozilla/5.0"},
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": fmt,
+                        "preferredquality": bitrate
+                    }]
+                }
+                def _download_audio():
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                         base = ydl.prepare_filename(info).rsplit(".", 1)[0]
                         src = f"{base}.{fmt}"
                         if os.path.exists(src):
                             os.replace(src, cached_path)
-                        file_path = cached_path
-                        thumb_url = info.get("thumbnail")
+                        return info
 
-                    tpath = f"downloads/thumb_{link_uid}.jpg"
-                    if download_thumbnail(thumb_url, tpath):
-                        thumb_path = tpath
+                info = await asyncio.to_thread(_download_audio)
+                file_path = cached_path
+                thumb_url = info.get("thumbnail")
 
-                cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel|{link_uid}")]])
-                download_msg = await cb.message.reply("📥 Downloading…\n" + progress_bar(0, 1), reply_markup=cancel_markup)
-                task_id = download_msg.id
-                active_tasks[task_id] = {"file": file_path, "thumb": thumb_path}
-
-                last = 0.0
-                async def on_progress(current, total):
-                    nonlocal last
-                    now = time.time()
-                    if now - last > 0.25:
-                        last = now
-                        await safe_edit(download_msg, f"📥 Downloading…\n{progress_bar(current, total)}", reply_markup=cancel_markup)
-
-                await cb.message.reply_audio(
-                    file_path,
-                    caption=f"✅ Here’s your {fmt.upper()} ({bitrate} kbps)",
-                    thumb=thumb_path if (thumb_path and os.path.exists(thumb_path)) else None,
-                    progress=on_progress
-                )
-
-                inc_downloads(1)
-                try:
-                    await download_msg.delete()
-                except Exception:
-                    pass
-                try:
-                    await status.delete()
-                except Exception:
-                    pass
-
-                active_tasks.pop(task_id, None)
-
+            # release slot after heavy work
+            try:
+                GLOBAL_DL_SEM.release()
             except Exception:
+                pass
+
+            if thumb_url:
+                tpath = f"downloads/thumb_{link_uid}.jpg"
+                if download_thumbnail(thumb_url, tpath):
+                    thumb_path = tpath
+
+            cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel|{link_uid}")]])
+            download_msg = await cb.message.reply("📥 Downloading…\n" + progress_bar(0, 1), reply_markup=cancel_markup)
+            task_id = download_msg.id
+            active_tasks[task_id] = {"file": file_path, "thumb": thumb_path}
+
+            last = 0.0
+            async def on_progress(current, total):
+                nonlocal last
+                now = time.time()
+                if now - last > 0.25:
+                    last = now
+                    await safe_edit(download_msg, f"📥 Downloading…\n{progress_bar(current, total)}", reply_markup=cancel_markup)
+
+            await cb.message.reply_audio(
+                file_path,
+                caption=f"✅ Here’s your {fmt.upper()} ({bitrate} kbps)",
+                thumb=thumb_path if (thumb_path and os.path.exists(thumb_path)) else None,
+                progress=on_progress
+            )
+
+            inc_downloads(1)
+            try:
+                await download_msg.delete()
+            except Exception:
+                pass
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            active_tasks.pop(task_id, None)
+
+        except Exception:
+            try:
+                await safe_edit(status, "❌ Something went wrong. Please try again.")
+            except Exception:
+                pass
+        finally:
+            if thumb_path and os.path.exists(thumb_path):
                 try:
-                    await safe_edit(status, "❌ Something went wrong. Please try again.")
+                    os.remove(thumb_path)
                 except Exception:
                     pass
-            finally:
-                if thumb_path and os.path.exists(thumb_path):
-                    try:
-                        os.remove(thumb_path)
-                    except Exception:
-                        pass
-
-        await enqueue_task(user_id, process_audio())
+            try:
+                if GLOBAL_DL_SEM.locked():
+                    GLOBAL_DL_SEM.release()
+            except Exception:
+                pass
 
     # ---- CANCEL download ----
     elif data.startswith("cancel|"):
