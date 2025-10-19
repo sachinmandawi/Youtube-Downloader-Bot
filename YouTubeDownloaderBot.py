@@ -474,11 +474,12 @@ async def start_cmd(client, message):
         _log(f"force-join check error: {e}")
 
     return await message.reply(
-        "✨ Welcome to YouTube Downloader\n"
-        "🎥 Paste a YouTube link & get your video or audio instantly.\n\n"
-        "👇 Send your link below!",
-        reply_markup=welcome_kb()
-    )
+    "✨ Welcome to YouTube Downloader!\n"
+    "🎬 Just drop your YouTube link here\n"
+    "🎧 Get high-quality Video or Audio in seconds\n\n"
+    "👇 Paste your link below to start!",
+    reply_markup=welcome_kb()
+)
 
 @bot.on_message((filters.regex(r"^/start(@[A-Za-z0-9_]+)?$") | filters.regex(r"^start$", re.IGNORECASE)) & filters.private)
 async def start_fallback(client, message):
