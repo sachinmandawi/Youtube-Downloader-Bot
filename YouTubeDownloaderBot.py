@@ -41,7 +41,7 @@ from pyrogram.errors import (
 # ================== BOT CONFIG (YOUR DATA) ==================
 API_ID = 23292615
 API_HASH = "fc15ff59f3a1d77e4d86ff6f3ded9d44"
-BOT_TOKEN = "8398662962:AAHD2YAC2BEovMdqg6XM-E8CYsez4T4U_mjY"
+BOT_TOKEN = "8398662962:AAHD2YAC2BEovMdqg6XM-E8CYsez46U_mjY"
 
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024 # 2GB
 os.makedirs("downloads", exist_ok=True)
