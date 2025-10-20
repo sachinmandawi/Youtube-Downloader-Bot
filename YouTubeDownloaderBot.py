@@ -22,6 +22,7 @@ import glob
 import hashlib
 import requests
 import json # Added for configuration persistence
+import inspect
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Dict, Tuple, Optional
@@ -209,20 +210,43 @@ def clean_youtube_url(url: str) -> str:
     return url.replace("youtube.com/shorts/", "youtube.com/watch?v=")
 
 def retry(times=3, delay=3):
+    """
+    Retry decorator that supports both sync and async functions.
+    - If the wrapped function is async, it will be awaited directly.
+    - If the wrapped function is sync, it will be executed via asyncio.to_thread.
+    The decorator itself returns an async wrapper (so call sites should await the decorated callable).
+    """
     def dec(fn):
-        @wraps(fn)
-        async def wrapper(*a, **k):
-            for i in range(times):
-                try:
-                    return await fn(*a, **k)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    if i < times - 1:
-                        await asyncio.sleep(delay)
-                    else:
+        is_coro = inspect.iscoroutinefunction(fn)
+        if is_coro:
+            @wraps(fn)
+            async def wrapper(*a, **k):
+                for i in range(times):
+                    try:
+                        return await fn(*a, **k)
+                    except asyncio.CancelledError:
                         raise
-        return wrapper
+                    except Exception:
+                        if i < times - 1:
+                            await asyncio.sleep(delay)
+                        else:
+                            raise
+            return wrapper
+        else:
+            @wraps(fn)
+            async def wrapper(*a, **k):
+                for i in range(times):
+                    try:
+                        # run sync function in thread
+                        return await asyncio.to_thread(fn, *a, **k)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if i < times - 1:
+                            await asyncio.sleep(delay)
+                        else:
+                            raise
+            return wrapper
     return dec
 
 # ---- Credits helpers ----
@@ -1418,7 +1442,8 @@ async def handle_callback(client, cb):
                     with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                         return ydl.extract_info(url, download=False)
 
-                info = await asyncio.to_thread(_get_info)
+                # await the decorated callable (wrapper handles running sync function in thread)
+                info = await _get_info()
                 title = info.get("title", "N/A")
                 duration = info.get("duration", 0)
                 channel = info.get("uploader", "Unknown")
@@ -1668,7 +1693,8 @@ async def handle_callback(client, cb):
                             pass
                         return info, fp, info.get("thumbnail")
 
-                info, file_path, thumb_url = await asyncio.to_thread(_download_video)
+                # await the decorated callable (wrapper handles running sync function in thread)
+                info, file_path, thumb_url = await _download_video()
 
                 # release slot after heavy work (Download is done)
                 try: GLOBAL_DL_SEM.release()
@@ -1946,7 +1972,8 @@ async def handle_callback(client, cb):
                             # Clean up intermediate files if needed, but rely on yt-dlp/os.replace for efficiency
                         return info
 
-                info = await asyncio.to_thread(_download_audio)
+                # await the decorated callable (wrapper handles running sync function in thread)
+                info = await _download_audio()
                 file_path = cached_path
                 thumb_url = info.get("thumbnail")
 
