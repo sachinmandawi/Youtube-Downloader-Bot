@@ -408,18 +408,29 @@ async def enter_global_queue_live(user_id: int, link_uid: str, kind: str, make_m
     try:
         while True:
             # Attempt to acquire the semaphore
+            acquired_sem = False
             try:
+                # Try to acquire quickly; if not available, Timeout expected
                 await asyncio.wait_for(GLOBAL_DL_SEM.acquire(), timeout=0.05)
-                
-                # Check if this job is at the front of the queue
-                target_queue = FAST_QUEUE if FAST_QUEUE else NORMAL_QUEUE
+                acquired_sem = True
+
+                # Check if this job is at the front of the combined priority queue
+                # Front-of-line is FAST_QUEUE if it has any items, otherwise NORMAL_QUEUE
+                target_queue = FAST_QUEUE if len(FAST_QUEUE) > 0 else NORMAL_QUEUE
                 if target_queue and target_queue[0][0] == job_id:
+                    # We hold the semaphore and it's our turn — remove from queue and continue
                     target_queue.popleft() # Remove from queue
                     await safe_edit(queued_msg, "✅ Your turn! Starting…")
-                    return job_id, queued_msg # Return with acquired semaphore and the status message
+                    # Leave the semaphore acquired for the consumer to release after heavy work
+                    return job_id, queued_msg
                 else:
-                    # Release and try again later if not our turn
-                    GLOBAL_DL_SEM.release() 
+                    # Not our turn — release the semaphore and try later
+                    try:
+                        GLOBAL_DL_SEM.release()
+                    except Exception:
+                        # If release fails for some reason, continue without raising to avoid crash.
+                        pass
+                    acquired_sem = False
             except asyncio.TimeoutError:
                 # Timeout is expected if semaphore is not immediately available
                 pass
@@ -448,13 +459,10 @@ async def enter_global_queue_live(user_id: int, link_uid: str, kind: str, make_m
             pass
         raise
     except Exception:
-        # If any other error occurs while waiting, ensure the semaphore is released if it was acquired 
-        # (check the semaphore value to prevent over-releasing)
-        try:
-            if GLOBAL_DL_SEM._value < int(CONFIG.get("global_parallel_limit", 5)):
-                GLOBAL_DL_SEM.release()
-        except Exception:
-            pass
+        # If any other error occurs while waiting, attempt to be safe and not over-release.
+        # We don't try to inspect semaphore internals (no _value access). Instead we only
+        # release if we believe we acquired it (local flag would have been reset).
+        # Since acquired_sem is local to the loop, nothing to do here except re-raise.
         raise
 
 # ================== FORCE-JOIN (JOIN GATE) ==================
